@@ -1,3 +1,4 @@
+from math import pi, sin
 import os
 import re
 import shutil
@@ -9,17 +10,49 @@ from os import PathLike
 from pathlib import Path
 from random import SystemRandom
 from time import time_ns
+import time
 
 from loguru import logger
 from PIL import Image
 
 random = SystemRandom()
 
+def progressBar(iterable, prefix = '', suffix = '', decimals = 1, length = 100, fill = '#', printEnd = "\r"):
+    """
+    Call in a loop to create terminal progress bar
+    @params:
+        iterable    - Required  : iterable object (Iterable)
+        prefix      - Optional  : prefix string (Str)
+        suffix      - Optional  : suffix string (Str)
+        decimals    - Optional  : positive number of decimals in percent complete (Int)
+        length      - Optional  : character length of bar (Int)
+        fill        - Optional  : bar fill character (Str)
+        printEnd    - Optional  : end character (e.g. "\r", "\r\n") (Str)
+    """
+    total = len(iterable)
+    start_time = time.time()
+    # Progress Bar Printing Function
+    def printProgressBar (iteration):
+        percent = ("{0:." + str(decimals) + "f}").format(100 * (iteration / float(total)))
+        filledLength = int(length * iteration // total)
+        bar = fill * filledLength + '-' * (length - filledLength)
+        estimate = (time.time() - start_time) * total / (iteration+1) - (time.time() - start_time)
+        print(f'\r{prefix} [{bar}] {percent}% {suffix} ~{round(estimate, 1)}s', end = printEnd)
+    # Initial Call
+    printProgressBar(0)
+    # Update Progress Bar
+    for i, item in enumerate(iterable):
+        yield item
+        
+        printProgressBar(i + 1)
+    # Print New Line on Complete
+    print()
 
 class ModeEnum(Enum):
     RANDOM = 1
     GROWING = 2
     SQUASH = 3
+    SPECIAL = 4
 
 
 @logger.catch()
@@ -40,6 +73,9 @@ class WebmDynamicResolution:
         self.concat_path = self.temp / "concat.txt"
 
     def __call__(self):
+        logger.info(f"Doctoring {self.input_path} with mode {self.mode} to {self.output_path}")
+        logger.info("Extracting Audio...")
+        self.extract_audio()
         logger.info("Extracting frames...")
         self.extract_frames()
         frame_rate = self.extract_frames()
@@ -50,6 +86,17 @@ class WebmDynamicResolution:
         self.frames_to_webms(frame_bases, frame_rate)
         logger.info("Concatting WebMs...")
         self.concat_webms(frame_bases)
+        logger.info("Joining audio...")
+
+        logger.info(f"File created at {self.output_path}")
+
+    def extract_audio(self):
+        out_path = self.temp / "extracted_audio.ogg"
+        cmd = subprocess.run(
+          ["ffmpeg", "-hide_banner", "-i", str(self.input_path), "-f", "ogg", "-ab", "192000", "-vn", str(out_path)],
+          text=True,
+          stderr=subprocess.PIPE,
+        )
 
     def extract_frame_rate(self, out: str) -> str:
         lines = out.split("\n")
@@ -75,11 +122,12 @@ class WebmDynamicResolution:
         return list(Path(self.temp).glob("*.png"))
 
     def resize_images(self, frame_bases: list[Path]):
-        for i, base in enumerate(frame_bases):
+        for i, base in enumerate(progressBar(frame_bases, prefix='Progress:', suffix='Complete', length=50)):
             res_image_path = base.parent / f"{base.stem}_r{base.suffix}"
             with Image.open(base) as f:
                 if i == 0:
                     x, y = f.size
+                    original_x, original_y = x, y
                     shutil.copy2(base, res_image_path)
                     continue
                 if self.mode == ModeEnum.RANDOM:
@@ -97,10 +145,15 @@ class WebmDynamicResolution:
                     else:
                         y = 1
                     img = f.resize((x, y), resample=Image.Resampling.LANCZOS)
+                elif self.mode == ModeEnum.SPECIAL:
+                    frames_per_bounce = 24
+                    y = round(original_y*0.5*sin((i*pi/frames_per_bounce)-(0.5*pi))+original_y*0.5+1)
+                    img = f.resize((x, y), resample=Image.Resampling.LANCZOS)
+
                 img.save(res_image_path)
 
     def frames_to_webms(self, frame_bases: list[Path], frame_rate: str):
-        for base in frame_bases:
+        for base in progressBar(frame_bases, prefix='Progress:', suffix='Complete', length=50):
             in_filename = base.parent / f"{base.stem}_r{base.suffix}"
             out_filename = base.parent / f"{base.stem}.webm"
             cmd = subprocess.run(
@@ -148,7 +201,7 @@ class WebmDynamicResolution:
                 "-c",
                 "copy",
                 "-y",
-                str(self.output_path),
+                str(self.temp / "no_audio.webm"),
             ],
             text=True,
             stderr=subprocess.PIPE,
@@ -156,11 +209,35 @@ class WebmDynamicResolution:
         if cmd.returncode != 0:
             logger.error(cmd.stderr)
             sys.exit(cmd.returncode)
+    def add_audio(self):
+        audio_path = self.temp / "extracted_audio.ogg"
+        cmd = subprocess.run(
+          [
+            "ffmpeg",
+            "-i",
+            str(self.temp / "no_audio.webm"),
+            "-i",
+            str(audio_path),
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c:v",
+            "copy",
+            "-shortest",
+            str(self.output_path)
+          ],
+          check=True,
+          text=True,
+          stdout=subprocess.PIPE,
+          stderr=subprocess.STDOUT,
+        )
+        print(cmd.stdout)
 
 
 def cli():
     parser = ArgumentParser()
-    parser.add_argument("-m", "--mode", type=int, help="1 = random, 2 = growing, 3 = squash. default = 1", default=1)
+    parser.add_argument("-m", "--mode", type=int, help="1 = random, 2 = growing, 3 = squash, 4 = special. default = 1", default=1)
     parser.add_argument("-o", "--output-path", type=str, help="Path to write output file to.")
     parser.add_argument("input_path", metavar="input_path", type=str, nargs="+", help="Path of input file.")
     args = parser.parse_args()
@@ -178,9 +255,9 @@ def cli():
         webm_dr()
     except Exception as e:
         logger.exception(e)
-    finally:
-        if webm_dr.temp.exists():
-            shutil.rmtree(webm_dr.temp)
+    # finally:
+    #     if webm_dr.temp.exists():
+    #         shutil.rmtree(webm_dr.temp)
 
 
 if __name__ == "__main__":
