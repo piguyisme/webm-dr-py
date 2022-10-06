@@ -140,5 +140,9 @@ cython_debug/
 
 tmp/
 .idea/
+.vscode/
 *.mp4
 *.webm
+
+#stupid apple
+.DS_STORE
